@@ -53,6 +53,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   @impl true
   def init(opts) do
+    Process.flag(:trap_exit, true)
+
     case Config.settings() do
       {:ok, config} ->
         now_ms = System.monotonic_time(:millisecond)
@@ -77,6 +79,18 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, reason} ->
         {:stop, reason}
     end
+  end
+
+  @impl true
+  def terminate(_reason, state) do
+    Enum.each(state.running, fn {_id, entry} ->
+      stop_running_task(Map.get(entry, :pid), Map.get(entry, :ref), state.task_supervisor)
+
+      case stop_entry_processes(entry) do
+        :ok -> :ok
+        {:error, reason} -> raise "Local process stop NO-GO: #{inspect(reason)}"
+      end
+    end)
   end
 
   @impl true
@@ -236,6 +250,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     Logger.warning("Agent task blocked for issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} session_id=#{session_id}: #{error}")
 
+    :ok = stop_entry_processes(running_entry)
     block_issue_from_entry(state, issue_id, running_entry, error)
   end
 
@@ -560,6 +575,7 @@ defmodule SymphonyElixir.Orchestrator do
         state = record_session_completion_totals(state, running_entry)
 
         stop_running_task(pid, ref, state.task_supervisor)
+        :ok = stop_entry_processes(running_entry)
 
         if cleanup_workspace do
           cleanup_issue_workspace(Map.get(running_entry, :issue, identifier), running_entry)
@@ -732,6 +748,14 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp terminate_task(_pid, _task_supervisor), do: :ok
 
+  defp stop_entry_processes(%{workspace_path: path, worker_host: nil}) when is_binary(path) do
+    SymphonyElixir.LocalProcess.drain(path)
+  end
+
+  defp stop_entry_processes(entry) do
+    Workspace.stop_owned(Map.get(entry, :issue, Map.get(entry, :identifier)), Map.get(entry, :worker_host))
+  end
+
   defp stop_running_task(pid, ref, task_supervisor) do
     if is_pid(pid) do
       terminate_task(pid, task_supervisor)
@@ -751,6 +775,7 @@ defmodule SymphonyElixir.Orchestrator do
       state.task_supervisor
     )
 
+    :ok = stop_entry_processes(running_entry)
     block_issue_from_entry(state, issue_id, running_entry, error)
   end
 
@@ -946,7 +971,20 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        case Workspace.ensure_stopped(issue, worker_host) do
+          :ok ->
+            spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+
+          {:error, reason} ->
+            Logger.warning("Dispatch blocked by local process ownership for #{issue_context(issue)}: #{inspect(reason)}")
+
+            schedule_issue_retry(state, issue.id, normalize_retry_attempt(attempt) + 1, %{
+              identifier: issue.identifier,
+              issue_url: issue.url,
+              error: "local process recovery unconfirmed; dispatch blocked",
+              worker_host: worker_host
+            })
+        end
     end
   end
 

@@ -27,6 +27,12 @@ Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud se
 tools with configured host-side auth and removes declared tracker-token environment variables from
 the Codex child, so the agent does not need a second tracker login.
 
+A `turn/completed` notification succeeds only with explicit `params.turn.status: "completed"`
+and non-empty string thread and turn IDs.
+Statuses `failed` and `interrupted` produce the existing failure and cancellation events/errors.
+Unknown, missing, or malformed status information returns an unconfirmed-completion error and
+emits a failure event; terminal events retain the original protocol payload.
+
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
 
@@ -36,6 +42,13 @@ entries are in memory only; restarting the orchestrator clears that blocked map,
 tracker issue can become a dispatch candidate again after restart.
 
 ## How to use it
+
+The local process helper's existing exit 73 failure path emits one bounded stderr
+`ERROR NO-GO` diagnostic, retained by AppServer at warning level. It includes only
+safe exception labels, numeric errno, and the last six traceback frame locations
+(trusted helper function/line or fixed external labels), with a truncation flag.
+Exception messages and command/configuration contents are omitted. Historical
+exit 73 failures without detailed logs still have an unknown cause.
 
 1. Make sure your codebase is set up to work well with agents: see
    [Harness engineering](https://openai.com/index/harness-engineering/).
@@ -403,3 +416,27 @@ you.
 ## License
 
 This project is licensed under the [Apache License 2.0](../LICENSE).
+
+## Local Linux command lifetime
+
+Local hooks and app-server commands use the existing Bubblewrap PID namespace support and Python standard library. These tools must already be available; Symphony does not install them or fall back to an unguarded command. SSH worker behavior is unchanged and is not covered by this local recovery guarantee.
+
+One private workspace lock and an identity receipt under the workspace root's `.symphony-processes/` directory survive worker/VM restarts. A live owner, changed boot/start/UID/namespace identity, malformed receipt, or unconfirmed exit blocks dispatch. Only a verified nested PID-namespace init is signalled through a pidfd. Namespace exit kills all descendants, including processes which change sessions. The command sees ownership records read-only; a blocked stdin cannot block stop handling.
+
+Local shutdown waits for OS process exit, separately from BEAM task exit. Before deleting a local workspace, Symphony preserves and reads back a tar snapshot and, for Git workspaces, the binary diff. Failure leaves the workspace and evidence in place. Receipts and snapshots are outside the per-Issue folder and are not automatically removed.
+
+This assumes a trusted operator UID and local filesystem. Locks serialize cooperating writers; they do not defend against a malicious external process with the same UID modifying operator state. PID-namespace changes across containers, remote workers, missing kernel/tool support, and unverified ownership remain NO-GO. No authentication, billing, scheduler, retry, or tracker policy is added or changed.
+
+Model-free regressions: `python3 -B test/local_process_test.py` and the ordinary `mix test` entry for `test/symphony_elixir/local_process_test.exs`. The retained isolated integration script is `test/local_recovery_integration.exs`; use the dedicated disposable WORKFLOW/evidence paths described in the run's REPRODUCE.md. Never point it at a production tracker/workspace.
+
+An ownership-blocked local dispatch keeps a retry with the existing capped
+backoff in the orchestrator queue. No worker is started until `LocalProcess.recover/1` confirms
+the previous command is stopped; a refused retry must not leave a claim without
+a scheduled recovery check. Active tracker issues remain eligible after recovery,
+while terminal or no-longer-routable issues follow the normal claim-release path.
+
+Local startup status is read as a complete line within the existing three-second
+startup deadline and a 4096-byte bound before the command barrier is released.
+Fragmented pipe reads are not malformed completion events; truncated, silent,
+oversized, or invalid status remains NO-GO. Closing an already closed port is
+idempotent, but the same OS ownership drain must still succeed before returning.

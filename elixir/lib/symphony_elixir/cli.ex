@@ -187,10 +187,11 @@ defmodule SymphonyElixir.CLI do
 
         receive do
           {:DOWN, ^ref, :process, ^pid, reason} ->
-            case reason do
-              :normal -> System.halt(0)
-              _ -> System.halt(1)
-            end
+            # A supervisor goes down before the application stop callback finishes.
+            # Keep the VM shutdown orderly instead of halting it in that interval.
+            status = if reason in [:normal, :shutdown], do: 0, else: 1
+            System.stop(status)
+            Process.sleep(:infinity)
         end
     end
   end

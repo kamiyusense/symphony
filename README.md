@@ -39,3 +39,5 @@ help with the setup:
 ## License
 
 This project is licensed under the [Apache License 2.0](LICENSE).
+
+Local Linux command shutdown/recovery and preservation requirements are documented in [the Elixir run instructions](elixir/README.md#local-linux-command-lifetime). No unattended-production approval is implied.

@@ -93,7 +93,10 @@ defmodule SymphonyElixir.AgentRunner do
       try do
         do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
       after
-        AppServer.stop_session(session)
+        case AppServer.stop_session(session) do
+          :ok -> :ok
+          {:error, reason} -> raise "Local process stop NO-GO: #{inspect(reason)}"
+        end
       end
     end
   end

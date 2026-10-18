@@ -142,7 +142,11 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  @spec stop_session(session()) :: :ok
+  @spec stop_session(session()) :: :ok | {:error, term()}
+  def stop_session(%{port: port, workspace: workspace, worker_host: nil}) when is_port(port) do
+    SymphonyElixir.LocalProcess.stop(port, workspace)
+  end
+
   def stop_session(%{port: port}) when is_port(port) do
     stop_port(port)
   end
@@ -190,27 +194,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp start_port(workspace, nil, dynamic_tool_binding) do
-    executable = System.find_executable("bash")
-
-    if is_nil(executable) do
-      {:error, :bash_not_found}
-    else
-      port =
-        Port.open(
-          {:spawn_executable, String.to_charlist(executable)},
-          [
-            :binary,
-            :exit_status,
-            :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(local_launch_command(dynamic_tool_binding))],
-            cd: String.to_charlist(workspace),
-            env: tracker_secret_port_env(dynamic_tool_binding),
-            line: @port_line_bytes
-          ]
-        )
-
-      {:ok, port}
-    end
+    SymphonyElixir.LocalProcess.open(workspace, local_launch_command(dynamic_tool_binding), env: tracker_secret_port_env(dynamic_tool_binding), line: @port_line_bytes)
   end
 
   defp start_port(workspace, worker_host, dynamic_tool_binding) when is_binary(worker_host) do
@@ -405,8 +389,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     case Jason.decode(payload_string) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
-        emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
-        {:ok, :turn_completed}
+        handle_turn_completed(on_message, payload, payload_string, port)
 
       {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
         emit_turn_event(
@@ -475,6 +458,29 @@ defmodule SymphonyElixir.Codex.AppServer do
 
         receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
     end
+  end
+
+  defp handle_turn_completed(on_message, payload, payload_string, port) do
+    params = Map.get(payload, "params")
+
+    {event, result, details} =
+      case params do
+        %{"threadId" => thread_id, "turn" => %{"id" => turn_id, "status" => "completed"}}
+        when is_binary(thread_id) and thread_id != "" and is_binary(turn_id) and turn_id != "" ->
+          {:turn_completed, {:ok, :turn_completed}, payload}
+
+        %{"turn" => %{"status" => "failed"}} ->
+          {:turn_failed, {:error, {:turn_failed, params}}, params}
+
+        %{"turn" => %{"status" => "interrupted"}} ->
+          {:turn_cancelled, {:error, {:turn_cancelled, params}}, params}
+
+        _ ->
+          {:turn_failed, {:error, {:turn_completion_unconfirmed, params}}, params}
+      end
+
+    emit_turn_event(on_message, event, payload, payload_string, port, details)
+    result
   end
 
   defp emit_turn_event(on_message, event, payload, payload_string, port, payload_details) do
