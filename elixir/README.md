@@ -469,3 +469,21 @@ is not evidence of Linux isolation or recovery; the real OS suite remains requir
 The standalone `test/local_recovery_integration.exs` remains an explicitly configured
 integration harness from earlier evidence. Mix does not auto-discover it; no new
 run or new PASS is claimed for that harness by either subset gate.
+
+### Dependency security baseline
+
+The lockfile includes reviewed security updates for the HTTP server/client and
+LiveView stack. Direct dependency floors retain Bandit 1.13, Phoenix 1.8.15,
+LiveView 1.1.33 and Req 0.7.5. Ecto 3.14 and Solid 1.3.4 allow the fixed Decimal
+3.x dependency; Jason also supports that version. Mint 1.11 and HPAX 1.1 remain
+locked. Req no longer automatically unpacks archive responses; JSON tracker
+responses remain supported. Do not opt untrusted endpoints into archive decoding.
+Explicit empty or whitespace-only worker commands remain invalid; the changeset
+checks them independently of Ecto's required-field empty-value semantics.
+
+Run `mix hex.audit` with fresh official advisory metadata alongside the existing
+quality gates. A clean advisory result is a point-in-time check, not a guarantee
+that future vulnerabilities cannot be discovered. Dependency security regressions
+are included in both Portable and full tests. The standalone recovery harness is
+explicitly classified outside Mix auto-discovery; its separate execution path and
+the complete OS isolation gate remain unchanged.
