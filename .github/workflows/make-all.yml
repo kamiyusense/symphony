@@ -34,5 +34,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-mix-
 
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap
+          test -f /usr/bin/bwrap
+          test -x /usr/bin/bwrap
+          /usr/bin/bwrap --version
+
       - name: Verify make all
         run: make all
