@@ -22,6 +22,8 @@ defmodule SymphonyElixir.OrchestratorRecoveryRetryTest do
     {:ok, tasks} = Task.Supervisor.start_link()
     name = Module.concat(__MODULE__, "Retry#{System.unique_integer([:positive])}")
     {:ok, orch} = Orchestrator.start_link(name: name, task_supervisor: tasks)
+    Process.unlink(orch)
+    Process.unlink(tasks)
     :sys.get_state(orch)
 
     helper = Path.expand("../../priv/local_process.py", __DIR__)
@@ -113,7 +115,7 @@ defmodule SymphonyElixir.OrchestratorRecoveryRetryTest do
 
   for status <- ["failed", "interrupted", "unknown"] do
     @status status
-    test "a #{@status} worker is not successful and the same active issue can retry after recovery" do
+    test "a #{@status} worker is not successful and retries only after terminal proof" do
       root = Path.join(System.tmp_dir!(), "recovery-outcome-#{System.unique_integer([:positive])}")
       File.mkdir_p!(root)
 
@@ -132,6 +134,8 @@ defmodule SymphonyElixir.OrchestratorRecoveryRetryTest do
       {:ok, tasks} = Task.Supervisor.start_link()
       name = Module.concat(__MODULE__, "Outcome#{System.unique_integer([:positive])}")
       {:ok, orch} = Orchestrator.start_link(name: name, task_supervisor: tasks)
+      Process.unlink(orch)
+      Process.unlink(tasks)
 
       on_exit(fn ->
         if Process.alive?(orch), do: GenServer.stop(orch)
@@ -147,7 +151,7 @@ defmodule SymphonyElixir.OrchestratorRecoveryRetryTest do
         wait_until(
           fn ->
             state = :sys.get_state(orch)
-            if Map.has_key?(state.retry_attempts, issue.id), do: state
+            if Map.has_key?(state.retry_attempts, issue.id) or Map.has_key?(state.blocked, issue.id), do: state
           end,
           400
         )
@@ -156,26 +160,36 @@ defmodule SymphonyElixir.OrchestratorRecoveryRetryTest do
       assert state.running == %{}
       assert Task.Supervisor.children(tasks) == []
       assert length(launches(root)) == 1
-      send(orch, :tick)
-      state = :sys.get_state(orch)
-      assert length(launches(root)) == 1
-      retry = state.retry_attempts[issue.id]
-      Process.cancel_timer(retry.timer_ref)
-      send(orch, {:retry_issue, issue.id, retry.retry_token})
 
-      state =
-        wait_until(
-          fn ->
-            state = :sys.get_state(orch)
-            if MapSet.member?(state.completed, issue.id), do: state
-          end,
-          400
-        )
+      if @status == "unknown" do
+        assert state.blocked[issue.id].recovery_blocked
+        assert MapSet.member?(state.claimed, issue.id)
+        refute Map.has_key?(state.retry_attempts, issue.id)
+        send(orch, :tick)
+        :sys.get_state(orch)
+        assert length(launches(root)) == 1
+      else
+        send(orch, :tick)
+        state = :sys.get_state(orch)
+        assert length(launches(root)) == 1
+        retry = state.retry_attempts[issue.id]
+        Process.cancel_timer(retry.timer_ref)
+        send(orch, {:retry_issue, issue.id, retry.retry_token})
 
-      Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
-      assert state.running == %{}
-      assert Task.Supervisor.children(tasks) == []
-      assert length(launches(root)) == 2
+        state =
+          wait_until(
+            fn ->
+              state = :sys.get_state(orch)
+              if MapSet.member?(state.completed, issue.id), do: state
+            end,
+            400
+          )
+
+        Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+        assert state.running == %{}
+        assert Task.Supervisor.children(tasks) == []
+        assert length(launches(root)) == 2
+      end
     end
   end
 

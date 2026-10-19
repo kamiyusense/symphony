@@ -4,6 +4,7 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
+  alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.{Config, LocalProcess, PathSafety, SSH}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
@@ -40,11 +41,14 @@ defmodule SymphonyElixir.Workspace do
   @spec ensure_stopped(map() | String.t(), worker_host()) :: :ok | {:error, term()}
   def ensure_stopped(issue, nil) do
     with {:ok, workspace} <- workspace_path_for_issue(workspace_key(issue), nil) do
-      LocalProcess.recover(workspace)
+      with :ok <- LocalProcess.recover(workspace), do: AppServer.recovery_ready(workspace)
     end
   end
 
-  def ensure_stopped(_issue, host) when is_binary(host), do: :ok
+  def ensure_stopped(issue, host) when is_binary(host) do
+    with {:ok, workspace} <- workspace_path_for_issue(workspace_key(issue), host),
+         do: AppServer.recovery_ready(workspace, host)
+  end
 
   @spec stop_owned(map() | String.t(), worker_host()) :: :ok | {:error, term()}
   def stop_owned(issue, nil) do
@@ -175,7 +179,8 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp remove_local_workspace(workspace) do
-    with :ok <- maybe_run_before_remove_hook(workspace, nil),
+    with :ok <- AppServer.recovery_ready(workspace),
+         :ok <- maybe_run_before_remove_hook(workspace, nil),
          :ok <- LocalProcess.snapshot(workspace) do
       File.rm_rf(workspace)
     else

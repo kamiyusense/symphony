@@ -4,11 +4,13 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH, Workflow}
 
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
+  @interrupt_limit_ms 2_000
+  @active_turn_key {__MODULE__, :active_turn}
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @type session :: %{
@@ -42,7 +44,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
-      metadata = port_metadata(port, worker_host)
+      metadata = Map.merge(port_metadata(port, worker_host), %{session_owner: self(), app_server_session: Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)})
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
            {:ok, thread_id} <-
@@ -70,16 +72,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   @spec run_turn(session(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run_turn(
-        %{
-          port: port,
-          metadata: metadata,
-          approval_policy: approval_policy,
-          auto_approve_requests: auto_approve_requests,
-          turn_sandbox_policy: turn_sandbox_policy,
-          thread_id: thread_id,
-          workspace: workspace,
-          dynamic_tool_binding: dynamic_tool_binding
-        },
+        %{workspace: workspace, thread_id: thread_id, worker_host: worker_host, metadata: metadata} = app_session,
         prompt,
         issue,
         opts \\ []
@@ -88,11 +81,58 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     tool_executor =
       Keyword.get(opts, :tool_executor, fn tool, arguments ->
-        DynamicTool.execute(tool, arguments, dynamic_tool_binding, issue: issue)
+        DynamicTool.execute(tool, arguments, app_session.dynamic_tool_binding, issue: issue)
       end)
 
+    with :ok <- validate_session_owner(app_session),
+         {:ok, receipt} <- begin_turn_receipt(workspace, thread_id, issue.id, worker_host, metadata.app_server_session) do
+      Process.put(@active_turn_key, %{port: app_session.port, thread_id: thread_id, turn_id: nil, issue_id: issue.id, receipt: receipt})
+
+      try do
+        result = run_active_turn(app_session, prompt, issue, on_message, tool_executor)
+        # An early error/input-required/timeout can leave a live cloud turn. Interrupt before closing stdin.
+        active = Process.get(@active_turn_key)
+
+        if needs_interrupt?(active, result, workspace, worker_host) do
+          interrupt_active_turn(active, [], on_message, "")
+        end
+
+        result
+      after
+        Process.delete(@active_turn_key)
+      end
+    end
+  end
+
+  defp validate_session_owner(%{port: port, metadata: %{session_owner: owner}}) when owner == self() do
+    if Port.info(port, :connected) == {:connected, owner}, do: :ok, else: {:error, :session_owner_mismatch}
+  end
+
+  defp validate_session_owner(_session), do: {:error, :session_owner_mismatch}
+
+  defp needs_interrupt?(active, result, workspace, worker_host) do
+    recovery_ready(workspace, worker_host) != :ok and is_binary(active.turn_id) and
+      not match?({:error, {:turn_interrupt, _}}, result)
+  end
+
+  defp run_active_turn(
+         %{
+           port: port,
+           metadata: metadata,
+           approval_policy: approval_policy,
+           auto_approve_requests: auto_approve_requests,
+           turn_sandbox_policy: turn_sandbox_policy,
+           thread_id: thread_id,
+           workspace: workspace
+         },
+         prompt,
+         issue,
+         on_message,
+         tool_executor
+       ) do
     case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
       {:ok, turn_id} ->
+        Process.put(@active_turn_key, Map.put(Process.get(@active_turn_key), :turn_id, turn_id))
         session_id = "#{thread_id}-#{turn_id}"
         Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
 
@@ -151,12 +191,159 @@ defmodule SymphonyElixir.Codex.AppServer do
     stop_port(port)
   end
 
+  @doc "Ask the session owner to interrupt its current Issue; never read another process's Port."
+  @spec interrupt(pid() | nil, String.t()) :: map()
+  def interrupt(owner, issue_id) when is_pid(owner) do
+    ref = Process.monitor(owner)
+    send(owner, {:interrupt_turn, self(), ref, issue_id})
+
+    result =
+      receive do
+        {:interrupt_result, ^ref, result} -> result
+        {:DOWN, ^ref, :process, ^owner, _} -> %{status: :interrupt_unconfirmed, reason: :owner_down}
+      after
+        interrupt_timeout() + 250 -> %{status: :interrupt_unconfirmed, reason: :owner_unresponsive}
+      end
+
+    Process.demonitor(ref, [:flush])
+    result
+  end
+
+  def interrupt(_owner, _issue_id), do: %{status: :interrupt_unconfirmed, reason: :owner_missing}
+
+  # These receipts live beside, not inside, the worker workspace and survive VM death/removal.
+  # The existing LocalProcess lease serializes writers for a workspace. No scheduler/retry lives here.
+  @spec recovery_ready(Path.t(), String.t() | nil) :: :ok | {:error, term()}
+  def recovery_ready(workspace, worker_host \\ nil) do
+    dir = turn_receipt_dir(workspace, worker_host)
+
+    case File.lstat(dir) do
+      {:error, :enoent} ->
+        :ok
+
+      {:ok, _} ->
+        check_turn_receipts(dir, workspace)
+
+      _ ->
+        {:error, :interrupt_receipt_unreadable}
+    end
+  end
+
+  defp check_turn_receipts(dir, workspace) do
+    with :ok <- private_receipt_dir(dir), {:ok, names} <- File.ls(dir) do
+      Enum.reduce_while(names, :ok, &check_next_receipt(&1, &2, dir, workspace))
+    end
+  end
+
+  defp check_next_receipt(name, :ok, dir, workspace) do
+    case check_turn_receipt(dir, name, workspace) do
+      :ok -> {:cont, :ok}
+      error -> {:halt, error}
+    end
+  end
+
+  defp check_turn_receipt(dir, name, workspace) do
+    if String.ends_with?(name, ".pending") do
+      pending = Path.join(dir, name)
+
+      with {:ok, data} <- read_receipt(pending),
+           {:ok, ^data} <- read_receipt(pending <> ".resolved"),
+           {:ok, record} <- Jason.decode(data),
+           true <- valid_turn_receipt?(record, name, workspace) do
+        :ok
+      else
+        _ -> {:error, :interrupt_completion_unconfirmed}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp valid_turn_receipt?(%{"workspace" => stored, "session" => session, "thread_id" => thread, "issue_id" => issue}, name, workspace)
+       when is_binary(session) and is_binary(thread) and is_binary(issue) do
+    stored == Path.expand(workspace) and session <> ".pending" == name
+  end
+
+  defp valid_turn_receipt?(_record, _name, _workspace), do: false
+
+  defp interrupt_timeout, do: min(max(Config.settings!().codex.read_timeout_ms, 1), @interrupt_limit_ms)
+
+  defp turn_receipt_dir(workspace, worker_host) do
+    key = :crypto.hash(:sha256, Path.expand(workspace)) |> Base.encode16(case: :lower)
+    base = if is_nil(worker_host), do: Path.dirname(Path.expand(workspace)), else: Path.dirname(Workflow.workflow_file_path())
+    Path.join([base, ".symphony-processes", key, "turns"])
+  end
+
+  defp private_receipt_dir(dir) do
+    # lstat rejects symlinks. Never chmod a pre-existing directory or follow a redirected receipt.
+    with {:ok, %{type: :directory, uid: uid, mode: mode}} <- File.lstat(dir),
+         {:ok, %{uid: ^uid}} <- File.stat("/proc/self"),
+         true <- Bitwise.band(mode, 0o077) == 0 do
+      :ok
+    else
+      _ -> {:error, :unsafe_interrupt_receipt_directory}
+    end
+  end
+
+  defp create_receipt_dir(dir) do
+    case File.mkdir(dir) do
+      :ok -> File.chmod(dir, 0o700)
+      {:error, :eexist} -> :ok
+      error -> error
+    end
+    |> case do
+      :ok -> private_receipt_dir(dir)
+      error -> error
+    end
+  end
+
+  defp read_receipt(path) do
+    with {:ok, %{type: :regular, size: size, links: 1}} <- File.lstat(path),
+         true <- size <= 16_384,
+         {:ok, data} <- File.read(path) do
+      {:ok, data}
+    else
+      _ -> {:error, :invalid_interrupt_receipt}
+    end
+  end
+
+  defp write_receipt(path, data) do
+    case File.open(path, [:write, :binary, :exclusive, :sync]) do
+      {:ok, io} ->
+        try do
+          IO.binwrite(io, data)
+        after
+          File.close(io)
+        end
+
+      error ->
+        error
+    end
+  end
+
+  defp begin_turn_receipt(workspace, thread_id, issue_id, worker_host, app_server_session) do
+    dir = turn_receipt_dir(workspace, worker_host)
+
+    with :ok <- recovery_ready(workspace, worker_host),
+         :ok <- create_receipt_dir(Path.dirname(Path.dirname(dir))),
+         :ok <- create_receipt_dir(Path.dirname(dir)),
+         :ok <- create_receipt_dir(dir) do
+      nonce = Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
+      path = Path.join(dir, nonce <> ".pending")
+      data = Jason.encode!(%{workspace: Path.expand(workspace), thread_id: thread_id, issue_id: issue_id, session: nonce, app_server_session: app_server_session})
+      with :ok <- write_receipt(path, data), do: {:ok, %{path: path, data: data, session: app_server_session}}
+    end
+  end
+
+  defp resolve_turn_receipt(%{path: path, data: data}), do: write_receipt(path <> ".resolved", data)
+
   defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
     expanded_workspace = Path.expand(workspace)
     expanded_root = Config.local_workspace_root()
     expanded_root_prefix = expanded_root <> "/"
 
-    with {:ok, canonical_workspace} <- PathSafety.canonicalize(expanded_workspace),
+    with :ok <- recovery_ready(expanded_workspace),
+         {:ok, canonical_workspace} <- PathSafety.canonicalize(expanded_workspace),
          {:ok, canonical_root} <- PathSafety.canonicalize(expanded_root) do
       canonical_root_prefix = canonical_root <> "/"
 
@@ -176,6 +363,9 @@ defmodule SymphonyElixir.Codex.AppServer do
     else
       {:error, {:path_canonicalize_failed, path, reason}} ->
         {:error, {:invalid_workspace_cwd, :path_unreadable, path, reason}}
+
+      {:error, _} = error ->
+        error
     end
   end
 
@@ -315,7 +505,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     case await_response(port, @thread_start_id) do
       {:ok, %{"thread" => thread_payload}} ->
         case thread_payload do
-          %{"id" => thread_id} -> {:ok, thread_id}
+          %{"id" => thread_id} when is_binary(thread_id) and thread_id != "" -> {:ok, thread_id}
           _ -> {:error, {:invalid_thread_payload, thread_payload}}
         end
 
@@ -344,7 +534,8 @@ defmodule SymphonyElixir.Codex.AppServer do
     })
 
     case await_response(port, @turn_start_id) do
-      {:ok, %{"turn" => %{"id" => turn_id}}} -> {:ok, turn_id}
+      {:ok, %{"turn" => %{"id" => turn_id}}} when is_binary(turn_id) and turn_id != "" -> {:ok, turn_id}
+      {:ok, _} -> {:error, :invalid_turn_payload}
       other -> other
     end
   end
@@ -362,6 +553,16 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
     receive do
+      {:interrupt_turn, caller, ref, issue_id} ->
+        case Process.get(@active_turn_key) do
+          %{issue_id: ^issue_id, turn_id: turn_id} = active when is_binary(turn_id) ->
+            interrupt_active_turn(active, [{caller, ref}], on_message, pending_line)
+
+          _ ->
+            send(caller, {:interrupt_result, ref, %{status: :interrupt_unconfirmed, reason: :active_turn_unknown}})
+            receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests)
+        end
+
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
         handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
@@ -383,6 +584,131 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, :turn_timeout}
     end
   end
+
+  defp interrupt_active_turn(active, callers, on_message, pending_line) do
+    request_id = "interrupt-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    state = %{
+      active: active,
+      callers: callers,
+      request_id: request_id,
+      sent: false,
+      response: false,
+      terminal: false,
+      deadline: System.monotonic_time(:millisecond) + interrupt_timeout(),
+      on_message: on_message
+    }
+
+    result =
+      try do
+        line = Jason.encode!(%{"id" => request_id, "method" => "turn/interrupt", "params" => %{"threadId" => active.thread_id, "turnId" => active.turn_id}}) <> "\n"
+        # Do not suspend on a full stdio Port and thereby bypass the bounded deadline.
+        case Port.command(active.port, line, [:nosuspend]) do
+          true -> await_interrupt(%{state | sent: true}, pending_line)
+          false -> finish_interrupt(state, :interrupt_unconfirmed, :write_not_accepted)
+        end
+      rescue
+        ArgumentError -> finish_interrupt(state, :interrupt_unconfirmed, :port_closed)
+      end
+
+    {:error, {:turn_interrupt, result}}
+  end
+
+  defp await_interrupt(%{response: true, terminal: true} = state, _pending) do
+    case resolve_turn_receipt(state.active.receipt) do
+      :ok -> finish_interrupt(state, :interrupt_confirmed, :interrupted)
+      _ -> finish_interrupt(state, :interrupt_unconfirmed, :receipt_write_failed)
+    end
+  end
+
+  defp await_interrupt(state, pending) do
+    remaining = state.deadline - System.monotonic_time(:millisecond)
+
+    cond do
+      remaining <= 0 -> finish_interrupt(state, :interrupt_unconfirmed, :timeout)
+      byte_size(pending) > @port_line_bytes -> finish_interrupt(state, :interrupt_unconfirmed, :message_too_large)
+      true -> receive_interrupt(state, pending, remaining)
+    end
+  end
+
+  defp receive_interrupt(state, pending, remaining) do
+    port = state.active.port
+
+    receive do
+      {:interrupt_turn, caller, ref, issue_id} ->
+        if issue_id == state.active.issue_id do
+          await_interrupt(%{state | callers: [{caller, ref} | state.callers]}, pending)
+        else
+          send(caller, {:interrupt_result, ref, %{status: :interrupt_unconfirmed, reason: :wrong_issue}})
+          await_interrupt(state, pending)
+        end
+
+      {^port, {:data, {:noeol, bytes}}} ->
+        await_interrupt(state, pending <> to_string(bytes))
+
+      {^port, {:data, {:eol, bytes}}} ->
+        data = pending <> to_string(bytes)
+
+        if byte_size(data) > @port_line_bytes do
+          finish_interrupt(state, :interrupt_unconfirmed, :message_too_large)
+        else
+          handle_interrupt_payload(state, Jason.decode(data))
+        end
+
+      {^port, {:exit_status, _status}} ->
+        finish_interrupt(state, :interrupt_unconfirmed, :port_exit)
+    after
+      remaining -> finish_interrupt(state, :interrupt_unconfirmed, :timeout)
+    end
+  end
+
+  defp handle_interrupt_payload(state, {:ok, %{"id" => id} = payload}) when id == state.request_id do
+    case payload do
+      %{"error" => _} -> finish_interrupt(state, :interrupt_unconfirmed, :request_error)
+      %{"result" => result} when is_map(result) -> await_interrupt(%{state | response: true}, "")
+      _ -> finish_interrupt(state, :interrupt_unconfirmed, :invalid_response)
+    end
+  end
+
+  defp handle_interrupt_payload(state, {:ok, %{"method" => "turn/completed", "params" => params}}) do
+    if matching_turn?(params) do
+      case params do
+        %{"turn" => %{"status" => "interrupted"}} -> await_interrupt(%{state | terminal: true}, "")
+        _ -> finish_interrupt(state, :interrupt_unconfirmed, :terminal_not_interrupted)
+      end
+    else
+      await_interrupt(state, "")
+    end
+  end
+
+  defp handle_interrupt_payload(state, _payload), do: await_interrupt(state, "")
+
+  defp finish_interrupt(state, status, reason) do
+    result = %{
+      status: status,
+      reason: reason,
+      thread_id: state.active.thread_id,
+      turn_id: state.active.turn_id,
+      issue_id: state.active.issue_id,
+      app_server_session: state.active.receipt.session,
+      confirmed_at: DateTime.utc_now()
+    }
+
+    # Preserve a bounded, secret-free protocol receipt independently of local lease/drain evidence.
+    write_receipt(state.active.receipt.path <> ".interrupt", Jason.encode!(result))
+    Enum.each(state.callers, fn {caller, ref} -> send(caller, {:interrupt_result, ref, result}) end)
+    emit_message(state.on_message, :interrupt_result, result, %{})
+    result
+  end
+
+  defp matching_turn?(%{"threadId" => thread, "turn" => %{"id" => turn}}) do
+    case Process.get(@active_turn_key) do
+      %{thread_id: ^thread, turn_id: ^turn} when is_binary(turn) -> true
+      _ -> false
+    end
+  end
+
+  defp matching_turn?(_), do: false
 
   defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests) do
     payload_string = to_string(data)
@@ -464,24 +790,26 @@ defmodule SymphonyElixir.Codex.AppServer do
     params = Map.get(payload, "params")
 
     {event, result, details} =
-      case params do
-        %{"threadId" => thread_id, "turn" => %{"id" => turn_id, "status" => "completed"}}
-        when is_binary(thread_id) and thread_id != "" and is_binary(turn_id) and turn_id != "" ->
-          {:turn_completed, {:ok, :turn_completed}, payload}
-
-        %{"turn" => %{"status" => "failed"}} ->
-          {:turn_failed, {:error, {:turn_failed, params}}, params}
-
-        %{"turn" => %{"status" => "interrupted"}} ->
-          {:turn_cancelled, {:error, {:turn_cancelled, params}}, params}
-
-        _ ->
-          {:turn_failed, {:error, {:turn_completion_unconfirmed, params}}, params}
+      if matching_turn?(params) and known_terminal_status?(params) do
+        case resolve_turn_receipt(Process.get(@active_turn_key).receipt) do
+          :ok -> terminal_result(params, payload)
+          _ -> unconfirmed_terminal(params)
+        end
+      else
+        unconfirmed_terminal(params)
       end
 
     emit_turn_event(on_message, event, payload, payload_string, port, details)
     result
   end
+
+  defp known_terminal_status?(%{"turn" => %{"status" => status}}), do: status in ["completed", "failed", "interrupted"]
+  defp known_terminal_status?(_params), do: false
+
+  defp terminal_result(%{"turn" => %{"status" => "completed"}}, payload), do: {:turn_completed, {:ok, :turn_completed}, payload}
+  defp terminal_result(%{"turn" => %{"status" => "failed"}} = params, _payload), do: {:turn_failed, {:error, {:turn_failed, params}}, params}
+  defp terminal_result(%{"turn" => %{"status" => "interrupted"}} = params, _payload), do: {:turn_cancelled, {:error, {:turn_cancelled, params}}, params}
+  defp unconfirmed_terminal(params), do: {:turn_failed, {:error, {:turn_completion_unconfirmed, params}}, params}
 
   defp emit_turn_event(on_message, event, payload, payload_string, port, payload_details) do
     emit_message(

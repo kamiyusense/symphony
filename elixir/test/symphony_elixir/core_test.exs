@@ -457,6 +457,21 @@ defmodule SymphonyElixir.CoreTest do
     assert is_map(GenServer.call(restarted_pid, :snapshot))
     refute Process.alive?(first_worker_pid)
 
+    # An initial ownership refusal now retains the retry claim instead of bypassing
+    # its backoff on the next poll. Recover the pre-turn hook, then deliver that one reservation.
+    recovered_state =
+      eventually_value(fn ->
+        state = :sys.get_state(restarted_pid)
+        if map_size(state.running) > 0 or Map.has_key?(state.retry_attempts, issue.id), do: state
+      end)
+
+    if retry = recovered_state.retry_attempts[issue.id] do
+      assert MapSet.member?(recovered_state.claimed, issue.id)
+      assert :ok = SymphonyElixir.LocalProcess.drain(Path.join(test_root, issue.identifier))
+      Process.cancel_timer(retry.timer_ref)
+      send(restarted_pid, {:retry_issue, issue.id, retry.retry_token})
+    end
+
     second_worker_pid =
       eventually_value(fn ->
         children = Task.Supervisor.children(task_supervisor_name)

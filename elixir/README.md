@@ -487,3 +487,41 @@ that future vulnerabilities cannot be discovered. Dependency security regression
 are included in both Portable and full tests. The standalone recovery harness is
 explicitly classified outside Mix auto-discovery; its separate execution path and
 the complete OS isolation gate remain unchanged.
+
+
+### Formal active-turn interruption
+
+The Port owner handles a scoped stop message for its own Issue. Runtime metadata
+retains `thread_id`, `turn_id`, a random app-server session identity and the owner
+PID explicitly; session strings are never split to infer protocol targets. One
+`turn/interrupt` request is sent with the current `threadId` and `turnId`. Duplicate
+stop requests share that operation. A successful response **and** a matching
+`turn/completed` whose status is `interrupted` are required for
+`interrupt_confirmed`, in either arrival order. Other turns cannot confirm it.
+The wait has an absolute deadline of `min(codex.read_timeout_ms, 2000)` milliseconds;
+stdio writes do not suspend on a busy Port. Error, missing IDs/notification,
+timeout or owner death remains `interrupt_unconfirmed`.
+
+Issue termination, non-active/routing/missing transitions, stalls and orderly
+runtime shutdown use this owner control before the existing Task stop and owned
+process drain. Local cleanup is mandatory regardless of protocol outcome and is
+recorded separately. Turn timeout/input-required/early error also attempts
+interruption while the owner is still available. An unexpectedly dead owner
+cannot send an interrupt: local cleanup still runs, and an unresolved turn blocks
+redispatch. There is no automatic interrupt resend or cloud reconciliation.
+
+Before `turn/start`, a create-only pending receipt is synchronously written beside
+the workspace under `.symphony-processes/<workspace hash>/turns/`. Only a matching
+terminal event (or both interruption confirmations) creates its resolved receipt.
+Pending/resolved receipts are retained, including across VM restart and workspace
+removal; an unknown turn prevents dispatch and workspace deletion even after local
+process recovery. Unknown or malformed receipts fail closed. Protocol results and
+owned-process/namespace evidence are independent. Do not manually remove a pending
+receipt merely because local processes have exited. SSH protocol receipts use the
+operator's local WORKFLOW directory, not an assumed local copy of a remote path;
+remote OS recovery is still outside the local Linux guarantee.
+
+Model-free interruption tests live in `app_server_interrupt_test.exs` and belong
+to the required `os_isolation` gate. They do not prove a real cloud service has
+cancelled inference. A separately authorized real App Server interruption E2E is
+still required; this implementation does not grant unattended-production GO.

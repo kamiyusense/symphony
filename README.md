@@ -49,3 +49,9 @@ portable-ci`) from the required real-Linux isolation gate (`make -C elixir
 os-isolation`). The complete gate remains `make -C elixir all`. A Portable GitHub
 check cannot certify OS recovery, tracker redispatch, cloud interruption, or
 unattended production readiness. See the Elixir README for prerequisites and scope.
+
+Active-turn stops additionally require a scoped App Server interruption response
+and matching interrupted terminal event, followed by independent local owned-process
+cleanup. Unconfirmed turns retain a durable redispatch barrier; see
+[formal active-turn interruption](elixir/README.md#formal-active-turn-interruption).
+Model-free evidence does not establish real cloud cancellation.

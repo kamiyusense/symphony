@@ -7,7 +7,8 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, LocalProcess, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -83,14 +84,16 @@ defmodule SymphonyElixir.Orchestrator do
 
   @impl true
   def terminate(_reason, state) do
-    Enum.each(state.running, fn {_id, entry} ->
-      stop_running_task(Map.get(entry, :pid), Map.get(entry, :ref), state.task_supervisor)
+    # Always attempt local cleanup for every entry, including protocol failure.
+    outcomes =
+      Enum.map(state.running, fn {issue_id, entry} ->
+        stopped = stop_worker(entry, issue_id, state.task_supervisor)
+        Logger.info("Worker shutdown issue_id=#{issue_id} protocol=#{stopped.interrupt_result.status} local_cleanup=#{inspect(stopped.local_cleanup)}")
+        stopped.local_cleanup == :ok and entry_recovery_ready(stopped) == :ok
+      end)
 
-      case stop_entry_processes(entry) do
-        :ok -> :ok
-        {:error, reason} -> raise "Local process stop NO-GO: #{inspect(reason)}"
-      end
-    end)
+    if Enum.any?(outcomes, &(!&1)), do: raise("Runtime stop unconfirmed; recovery remains NO-GO")
+    :ok
   end
 
   @impl true
@@ -152,7 +155,20 @@ defmodule SymphonyElixir.Orchestrator do
         state = record_session_completion_totals(state, running_entry)
         session_id = running_entry_session_id(running_entry)
 
-        state = handle_agent_down(reason, state, issue_id, running_entry, session_id)
+        cleanup = cleanup_finished_worker(running_entry)
+
+        state =
+          case {cleanup, entry_recovery_ready(running_entry)} do
+            {:ok, :ok} ->
+              handle_agent_down(reason, state, issue_id, running_entry, session_id)
+
+            {{:error, _}, :ok} when reason != :normal ->
+              retry_agent_down(state, issue_id, running_entry, session_id, reason)
+
+            _ ->
+              entry = Map.put(running_entry, :local_cleanup, cleanup)
+              block_issue_from_entry(state, issue_id, entry, "interrupt or local recovery unconfirmed after worker exit")
+          end
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
 
@@ -470,6 +486,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_blocked_issue_state(%Issue{} = issue, state, active_states, terminal_states) do
     cond do
+      Map.get(Map.get(state.blocked, issue.id, %{}), :recovery_blocked, false) ->
+        refresh_blocked_issue_state(state, issue)
+
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Blocked issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing block")
         cleanup_issue_workspace(issue, Map.get(state.blocked, issue.id, %{}))
@@ -523,7 +542,7 @@ defmodule SymphonyElixir.Orchestrator do
       |> MapSet.new()
 
     Enum.reduce(requested_issue_ids, state, fn issue_id, state_acc ->
-      if MapSet.member?(visible_issue_ids, issue_id) do
+      if MapSet.member?(visible_issue_ids, issue_id) or Map.get(Map.get(state_acc.blocked, issue_id, %{}), :recovery_blocked, false) do
         state_acc
       else
         Logger.info("Blocked issue no longer visible during state refresh: issue_id=#{issue_id}; releasing block")
@@ -571,28 +590,33 @@ defmodule SymphonyElixir.Orchestrator do
       nil ->
         release_issue_claim(state, issue_id)
 
-      %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
+      %{pid: _, ref: _, identifier: identifier} = running_entry ->
         state = record_session_completion_totals(state, running_entry)
+        stopped = stop_worker(running_entry, issue_id, state.task_supervisor)
 
-        stop_running_task(pid, ref, state.task_supervisor)
-        :ok = stop_entry_processes(running_entry)
+        if stopped.local_cleanup == :ok and entry_recovery_ready(stopped) == :ok do
+          cleanup_stopped_workspace(cleanup_workspace, stopped, identifier)
 
-        if cleanup_workspace do
-          cleanup_issue_workspace(Map.get(running_entry, :issue, identifier), running_entry)
+          %{
+            state
+            | running: Map.delete(state.running, issue_id),
+              claimed: MapSet.delete(state.claimed, issue_id),
+              blocked: Map.delete(state.blocked, issue_id),
+              retry_attempts: Map.delete(state.retry_attempts, issue_id)
+          }
+        else
+          block_issue_from_entry(state, issue_id, stopped, "interrupt or local cleanup unconfirmed; restart blocked")
         end
-
-        %{
-          state
-          | running: Map.delete(state.running, issue_id),
-            claimed: MapSet.delete(state.claimed, issue_id),
-            blocked: Map.delete(state.blocked, issue_id),
-            retry_attempts: Map.delete(state.retry_attempts, issue_id)
-        }
 
       _ ->
         release_issue_claim(state, issue_id)
     end
   end
+
+  defp cleanup_stopped_workspace(true, stopped, identifier),
+    do: cleanup_issue_workspace(Map.get(stopped, :issue, identifier), stopped)
+
+  defp cleanup_stopped_workspace(false, _stopped, _identifier), do: :ok
 
   defp reconcile_stalled_running_issues(%State{} = state) do
     timeout_ms = Config.settings!().codex.stall_timeout_ms
@@ -641,9 +665,9 @@ defmodule SymphonyElixir.Orchestrator do
 
         next_attempt = next_retry_attempt_from_running(running_entry)
 
-        state
-        |> terminate_running_issue(issue_id, false)
-        |> schedule_issue_retry(issue_id, next_attempt, %{
+        stopped_state = terminate_running_issue(state, issue_id, false)
+
+        schedule_stalled_retry(stopped_state, issue_id, next_attempt, %{
           identifier: identifier,
           issue_url: running_entry.issue.url,
           error: "stalled for #{elapsed_ms}ms without codex activity"
@@ -652,6 +676,12 @@ defmodule SymphonyElixir.Orchestrator do
     else
       state
     end
+  end
+
+  defp schedule_stalled_retry(state, issue_id, attempt, metadata) do
+    if Map.has_key?(state.blocked, issue_id),
+      do: state,
+      else: schedule_issue_retry(state, issue_id, attempt, metadata)
   end
 
   defp stall_elapsed_ms(running_entry, now) do
@@ -678,8 +708,6 @@ defmodule SymphonyElixir.Orchestrator do
       codex_message_method(Map.get(running_entry, :last_codex_message)) ==
         "mcpServer/elicitation/request"
   end
-
-  defp input_required_blocker?(_running_entry), do: false
 
   defp input_required_completion_outcome(completion) when is_map(completion) do
     outcome = Map.get(completion, :outcome) || Map.get(completion, "outcome")
@@ -710,8 +738,6 @@ defmodule SymphonyElixir.Orchestrator do
       fallback
   end
 
-  defp blocker_error(_running_entry, fallback), do: fallback
-
   defp codex_event_blocker_error(:turn_input_required), do: "codex turn requires operator input"
   defp codex_event_blocker_error(:approval_required), do: "codex turn requires approval"
   defp codex_event_blocker_error(_event), do: nil
@@ -737,7 +763,14 @@ defmodule SymphonyElixir.Orchestrator do
   defp codex_message_method(_message), do: nil
 
   defp terminate_task(pid, task_supervisor) when is_pid(pid) do
-    case Task.Supervisor.terminate_child(task_supervisor, pid) do
+    result =
+      try do
+        Task.Supervisor.terminate_child(task_supervisor, pid)
+      catch
+        :exit, _ -> {:error, :not_found}
+      end
+
+    case result do
       :ok ->
         :ok
 
@@ -749,7 +782,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp terminate_task(_pid, _task_supervisor), do: :ok
 
   defp stop_entry_processes(%{workspace_path: path, worker_host: nil}) when is_binary(path) do
-    SymphonyElixir.LocalProcess.drain(path)
+    LocalProcess.drain(path)
   end
 
   defp stop_entry_processes(entry) do
@@ -769,14 +802,70 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp stop_and_block_issue(%State{} = state, issue_id, running_entry, error) do
-    stop_running_task(
-      Map.get(running_entry, :pid),
-      Map.get(running_entry, :ref),
-      state.task_supervisor
-    )
+    stopped = stop_worker(running_entry, issue_id, state.task_supervisor)
+    block_issue_from_entry(state, issue_id, stopped, error)
+  end
 
-    :ok = stop_entry_processes(running_entry)
-    block_issue_from_entry(state, issue_id, running_entry, error)
+  defp entry_recovery_ready(%{task_stop: {:error, _}}), do: {:error, :task_exit_unconfirmed}
+  defp entry_recovery_ready(%{interrupt_result: %{status: :interrupt_unconfirmed}}), do: {:error, :interrupt_unconfirmed}
+
+  defp entry_recovery_ready(%{workspace_path: workspace} = entry) when is_binary(workspace),
+    do: AppServer.recovery_ready(workspace, Map.get(entry, :worker_host))
+
+  defp entry_recovery_ready(entry) do
+    case Map.get(entry, :issue, Map.get(entry, :identifier)) do
+      nil -> :ok
+      issue -> Workspace.ensure_stopped(issue, Map.get(entry, :worker_host))
+    end
+  end
+
+  defp cleanup_finished_worker(%{workspace_path: workspace} = entry) when is_binary(workspace) do
+    if is_nil(Map.get(entry, :session_id)) and entry_recovery_ready(entry) == :ok and is_nil(Map.get(entry, :worker_host)) do
+      LocalProcess.recover(workspace)
+    else
+      stop_entry_processes(entry)
+    end
+  end
+
+  defp cleanup_finished_worker(entry), do: stop_entry_processes(entry)
+
+  defp stop_worker(entry, issue_id, supervisor) do
+    protocol =
+      if Map.get(entry, :last_codex_event) == :session_started or
+           (is_binary(Map.get(entry, :session_id)) and Map.get(entry, :last_codex_event) not in [:turn_completed, :turn_failed, :turn_cancelled, :turn_ended_with_error]) do
+        try do
+          AppServer.interrupt(Map.get(entry, :pid), issue_id)
+        rescue
+          _ -> %{status: :interrupt_unconfirmed, reason: :control_unavailable}
+        catch
+          :exit, _ -> %{status: :interrupt_unconfirmed, reason: :control_unavailable}
+        end
+      else
+        %{status: :not_applicable, reason: :no_observed_active_turn}
+      end
+
+    # Kill/drain is mandatory even if the owner timed out, died, or rejected interruption.
+    task_stop = stop_task_result(entry, supervisor)
+    cleanup = cleanup_result(entry)
+    task_stop = if is_pid(Map.get(entry, :pid)) and Process.alive?(entry.pid), do: {:error, :worker_exit_unconfirmed}, else: task_stop
+    Logger.info("Worker stop issue_id=#{issue_id} protocol=#{protocol.status} local_cleanup=#{inspect(cleanup)} task_stop=#{inspect(task_stop)}")
+    Map.merge(entry, %{interrupt_result: protocol, local_cleanup: cleanup, task_stop: task_stop})
+  end
+
+  defp stop_task_result(entry, supervisor) do
+    stop_running_task(Map.get(entry, :pid), Map.get(entry, :ref), supervisor)
+  rescue
+    _ -> {:error, :task_stop_failed}
+  catch
+    :exit, _ -> {:error, :task_stop_failed}
+  end
+
+  defp cleanup_result(entry) do
+    stop_entry_processes(entry)
+  rescue
+    _ -> {:error, :local_cleanup_failed}
+  catch
+    :exit, _ -> {:error, :local_cleanup_failed}
   end
 
   defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error) do
@@ -788,6 +877,10 @@ defmodule SymphonyElixir.Orchestrator do
       workspace_path: Map.get(running_entry, :workspace_path),
       session_id: running_entry_session_id(running_entry),
       error: error,
+      interrupt_result: Map.get(running_entry, :interrupt_result),
+      local_cleanup: Map.get(running_entry, :local_cleanup),
+      task_stop: Map.get(running_entry, :task_stop),
+      recovery_blocked: entry_recovery_ready(running_entry) != :ok or Map.get(running_entry, :local_cleanup, :ok) != :ok,
       blocked_at: DateTime.utc_now(),
       last_codex_message: Map.get(running_entry, :last_codex_message),
       last_codex_event: Map.get(running_entry, :last_codex_event),
@@ -981,7 +1074,7 @@ defmodule SymphonyElixir.Orchestrator do
             schedule_issue_retry(state, issue.id, normalize_retry_attempt(attempt) + 1, %{
               identifier: issue.identifier,
               issue_url: issue.url,
-              error: "local process recovery unconfirmed; dispatch blocked",
+              error: "local process or interrupt recovery unconfirmed; dispatch blocked",
               worker_host: worker_host
             })
         end
@@ -1095,7 +1188,8 @@ defmodule SymphonyElixir.Orchestrator do
 
     %{
       state
-      | retry_attempts:
+      | claimed: MapSet.put(state.claimed, issue_id),
+        retry_attempts:
           Map.put(state.retry_attempts, issue_id, %{
             attempt: next_attempt,
             timer_ref: timer_ref,
@@ -1460,6 +1554,9 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
           session_id: metadata.session_id,
+          thread_id: Map.get(metadata, :thread_id),
+          turn_id: Map.get(metadata, :turn_id),
+          app_server_session: Map.get(metadata, :app_server_session),
           codex_app_server_pid: metadata.codex_app_server_pid,
           codex_input_tokens: metadata.codex_input_tokens,
           codex_output_tokens: metadata.codex_output_tokens,
@@ -1559,6 +1656,10 @@ defmodule SymphonyElixir.Orchestrator do
         last_codex_timestamp: timestamp,
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
+        thread_id: Map.get(update, :thread_id, Map.get(running_entry, :thread_id)),
+        turn_id: Map.get(update, :turn_id, Map.get(running_entry, :turn_id)),
+        session_owner: Map.get(update, :session_owner, Map.get(running_entry, :session_owner)),
+        app_server_session: Map.get(update, :app_server_session, Map.get(running_entry, :app_server_session)),
         last_codex_event: event,
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
