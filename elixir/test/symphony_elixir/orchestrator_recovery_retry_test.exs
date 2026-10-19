@@ -1,5 +1,6 @@
 defmodule SymphonyElixir.OrchestratorRecoveryRetryTest do
   use SymphonyElixir.TestSupport
+  @moduletag :os_isolation
 
   test "an ownership-blocked retry remains scheduled until the workspace is recovered" do
     root = Path.join(System.tmp_dir!(), "recovery-reoffer-#{System.unique_integer([:positive])}")

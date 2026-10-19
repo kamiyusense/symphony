@@ -348,6 +348,7 @@ defmodule SymphonyElixir.CoreTest do
     assert Process.alive?(runtime_pid)
   end
 
+  @tag :os_isolation
   test "restarting the orchestrator does not overlap redispatched work" do
     issue_suffix = System.unique_integer([:positive])
 
@@ -538,6 +539,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  @tag :os_isolation
   test "terminal issue state stops running agent before cleaning workspace" do
     test_root =
       Path.join(
@@ -953,6 +955,7 @@ defmodule SymphonyElixir.CoreTest do
     refute Map.has_key?(updated_state.retry_attempts, issue_id)
   end
 
+  @tag :os_isolation
   test "retry releases its claim when dispatch revalidation no longer finds the issue" do
     test_root =
       Path.join(
@@ -1535,6 +1538,7 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt == "Retry #2"
   end
 
+  @tag :os_isolation
   test "agent runner keeps workspace after successful codex run" do
     test_root =
       Path.join(
@@ -1619,6 +1623,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  @tag :os_isolation
   test "agent runner forwards timestamped codex updates to recipient" do
     test_root =
       Path.join(
@@ -1777,6 +1782,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  @tag :os_isolation
   test "agent runner continues with a follow-up turn while the issue remains active" do
     test_root =
       Path.join(
@@ -1909,6 +1915,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  @tag :os_isolation
   test "agent runner stops continuing once agent.max_turns is reached" do
     test_root =
       Path.join(
@@ -2007,6 +2014,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  @tag :os_isolation
   test "app server starts with workspace cwd and expected startup command" do
     test_root =
       Path.join(
@@ -2153,6 +2161,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  @tag :os_isolation
   test "app server startup command supports codex args override from workflow config" do
     test_root =
       Path.join(
@@ -2238,6 +2247,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  @tag :os_isolation
   test "app server startup payload uses configurable approval and sandbox settings from workflow config" do
     test_root =
       Path.join(

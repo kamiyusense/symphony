@@ -1,5 +1,6 @@
 defmodule SymphonyElixir.AppServerTerminalStatusTest do
   use SymphonyElixir.TestSupport
+  @moduletag :os_isolation
 
   test "explicit completed status succeeds and preserves normal protocol events" do
     payload = completion("completed")

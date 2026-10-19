@@ -440,3 +440,32 @@ startup deadline and a 4096-byte bound before the command barrier is released.
 Fragmented pipe reads are not malformed completion events; truncated, silent,
 oversized, or invalid status remains NO-GO. Closing an already closed port is
 idempotent, but the same OS ownership drain must still succeed before returning.
+
+### Portable quality and required OS isolation gates
+
+`make --keep-going portable-ci` runs setup, build, format, specs/Credo, Portable
+coverage, the existing six Python diagnostic regressions, and Dialyzer.
+Independent checks continue after a failing prerequisite.
+`make portable-test` runs the Portable subset without coverage. These commands
+exclude `os_isolation` and opt-in `live_e2e` tests, not arbitrary failures.
+
+`make os-isolation` first checks Linux namespace and procfs prerequisites, then
+runs every `os_isolation` test. A failed or unknown required probe stops this gate
+as BLOCKED before tests; it never certifies isolation. The suite includes local
+AppServer/hook integrations and the 19-case Python ownership/recovery regression.
+These use model-free fake workers with real Linux isolation, not real Codex tasks.
+
+`make all` / `make ci` and `make coverage` retain the full test suite. No test was
+removed, no runtime safety code changed, and the 100% coverage threshold and
+module exclusions are unchanged. Portable coverage is measured independently;
+its result cannot replace full coverage or the required OS isolation evidence.
+GitHub runs only Portable quality and reports OS Isolation: NOT_RUN and Full
+Recovery Gate: NO-GO, even when Portable passes. LIVE tests remain separately opt-in.
+
+Portable bridge regressions use a scripted helper only to verify output, nonzero
+status, timeout, and control-error propagation in the Elixir adapter. Their PASS
+is not evidence of Linux isolation or recovery; the real OS suite remains required.
+
+The standalone `test/local_recovery_integration.exs` remains an explicitly configured
+integration harness from earlier evidence. Mix does not auto-discover it; no new
+run or new PASS is claimed for that harness by either subset gate.

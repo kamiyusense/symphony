@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.LocalProcessTest do
   use ExUnit.Case, async: false
 
+  @tag :os_isolation
   test "local Linux ownership, stop, crash, recovery and preservation regressions" do
     script = Path.expand("../local_process_test.py", __DIR__)
     evidence = System.get_env("ONE_TASK_EVIDENCE")

@@ -5,6 +5,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
   alias SymphonyElixir.Linear.Client
 
+  @tag :os_isolation
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
       Path.join(
@@ -109,6 +110,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  @tag :os_isolation
   test "workspace reuses existing issue directory without deleting local changes" do
     workspace_root =
       Path.join(
@@ -280,6 +282,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  @tag :os_isolation
   test "workspace surfaces after_create hook failures" do
     workspace_root =
       Path.join(
@@ -300,6 +303,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  @tag :os_isolation
   test "workspace retries after_create after a failed new workspace bootstrap" do
     test_root =
       Path.join(
@@ -332,6 +336,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  @tag :os_isolation
   test "workspace surfaces after_create hook timeouts" do
     workspace_root =
       Path.join(
@@ -862,6 +867,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert {:ok, []} = Workspace.remove(random_path)
   end
 
+  @tag :os_isolation
   test "workspace hooks support multiline YAML scripts and run at lifecycle boundaries" do
     test_root =
       Path.join(
@@ -900,6 +906,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  @tag :os_isolation
   test "workspace remove continues when before_remove hook fails" do
     test_root =
       Path.join(
@@ -925,6 +932,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  @tag :os_isolation
   test "workspace remove continues when before_remove hook fails with large output" do
     test_root =
       Path.join(
@@ -950,6 +958,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  @tag :os_isolation
   test "workspace remove continues when before_remove hook times out" do
     previous_timeout = Application.get_env(:symphony_elixir, :workspace_hook_timeout_ms)
 

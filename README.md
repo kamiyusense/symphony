@@ -41,3 +41,11 @@ help with the setup:
 This project is licensed under the [Apache License 2.0](LICENSE).
 
 Local Linux command shutdown/recovery and preservation requirements are documented in [the Elixir run instructions](elixir/README.md#local-linux-command-lifetime). No unattended-production approval is implied.
+
+### Verification scope
+
+The Elixir implementation separates Portable quality (`make -C elixir --keep-going
+portable-ci`) from the required real-Linux isolation gate (`make -C elixir
+os-isolation`). The complete gate remains `make -C elixir all`. A Portable GitHub
+check cannot certify OS recovery, tracker redispatch, cloud interruption, or
+unattended production readiness. See the Elixir README for prerequisites and scope.

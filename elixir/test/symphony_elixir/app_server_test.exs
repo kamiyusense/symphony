@@ -76,6 +76,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  @tag :os_isolation
   test "turn timeout resets on stream updates and fires after silence" do
     test_root =
       Path.join(
@@ -165,6 +166,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  @tag :os_isolation
   test "app server passes explicit turn sandbox policies through unchanged" do
     test_root =
       Path.join(
@@ -272,6 +274,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  @tag :os_isolation
   test "app server marks request-for-input events as a hard failure" do
     test_root =
       Path.join(
@@ -351,6 +354,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  @tag :os_isolation
   test "app server treats MCP elicitation requests as hard input blockers" do
     test_root =
       Path.join(
@@ -416,6 +420,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  @tag :os_isolation
   test "app server fails when command execution approval is required under safer defaults" do
     test_root =
       Path.join(
@@ -479,6 +484,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  @tag :os_isolation
   test "app server auto-approves command execution approval requests when approval policy is never" do
     test_root =
       Path.join(
@@ -616,6 +622,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  @tag :os_isolation
   test "app server auto-approves MCP tool approval prompts when approval policy is never" do
     test_root =
       Path.join(
@@ -715,6 +722,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  @tag :os_isolation
   test "app server blocks freeform tool input prompts" do
     test_root =
       Path.join(
@@ -785,6 +793,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  @tag :os_isolation
   test "app server blocks option-based tool input prompts" do
     test_root =
       Path.join(
@@ -855,6 +864,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  @tag :os_isolation
   test "app server rejects unsupported dynamic tool calls without stalling" do
     test_root =
       Path.join(
@@ -956,6 +966,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  @tag :os_isolation
   test "app server executes supported dynamic tool calls and returns the tool result" do
     test_root =
       Path.join(
@@ -1078,6 +1089,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  @tag :os_isolation
   test "app server emits tool_call_failed for supported tool failures" do
     test_root =
       Path.join(
@@ -1184,6 +1196,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  @tag :os_isolation
   test "app server buffers partial JSON lines until newline terminator" do
     test_root =
       Path.join(
@@ -1248,6 +1261,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  @tag :os_isolation
   test "app server captures codex side output and logs it through Logger" do
     test_root =
       Path.join(
@@ -1323,6 +1337,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  @tag :os_isolation
   test "app server emits malformed events for JSON-like protocol lines that fail to decode" do
     test_root =
       Path.join(
@@ -1394,6 +1409,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  @tag :os_isolation
   test "app server does not pass tracker credentials to the local Codex child" do
     test_root =
       Path.join(
