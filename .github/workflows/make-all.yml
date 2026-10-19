@@ -35,6 +35,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-mix-
 
+      - name: Audit Hex dependencies
+        id: hex_audit
+        run: mix hex.audit
+
       - name: Verify portable quality
         id: portable
         run: make --keep-going portable-ci
@@ -42,15 +46,24 @@ jobs:
       - name: Report verification scope
         if: always()
         env:
+          HEX_AUDIT_OUTCOME: ${{ steps.hex_audit.outcome }}
           PORTABLE_OUTCOME: ${{ steps.portable.outcome }}
         run: |
+          case "$HEX_AUDIT_OUTCOME" in
+            success) hex_result=PASS ;;
+            failure) hex_result=FAIL ;;
+            skipped|"") hex_result=NOT_RUN ;;
+            *) hex_result=UNKNOWN ;;
+          esac
           case "$PORTABLE_OUTCOME" in
             success) result=PASS ;;
             failure) result=FAIL ;;
-            *) result=NOT_RUN ;;
+            skipped|"") result=NOT_RUN ;;
+            *) result=UNKNOWN ;;
           esac
           {
+            printf 'Hex Audit: %s\n\n' "$hex_result"
             printf 'Portable Quality: %s\n\n' "$result"
             printf 'OS Isolation: NOT_RUN (separate required Linux gate)\n\n'
             printf 'Full Recovery Gate: NO-GO\n'
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
