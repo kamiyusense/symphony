@@ -35,6 +35,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-mix-
 
+      - name: Set up Hex
+        run: mix local.hex --force
+
       - name: Audit Hex dependencies
         id: hex_audit
         run: mix hex.audit
