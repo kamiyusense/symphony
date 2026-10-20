@@ -68,5 +68,7 @@ jobs:
             printf 'Hex Audit: %s\n\n' "$hex_result"
             printf 'Portable Quality: %s\n\n' "$result"
             printf 'OS Isolation: NOT_RUN (separate required Linux gate)\n\n'
-            printf 'Full Recovery Gate: NO-GO\n'
+            printf 'Full Recovery Gate: NO-GO (this Portable CI alone; OS Isolation is NOT_RUN)\n\n'
+            printf 'Recorded Recovery Goal (LOCAL_ONLY): GO (assessed implementation a0a962fd389a57341703ff595adb5062b385e5bc; docs/symphony-recovery-goal-closure.md)\n\n'
+            printf 'Production Unattended: NO-GO\n'
           } | tee -a "$GITHUB_STEP_SUMMARY"
