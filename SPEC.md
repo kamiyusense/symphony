@@ -2310,3 +2310,7 @@ Extension config:
 - Cleanup and observability:
   - Operators need to know which host owns a run, where its workspace lives, and whether cleanup
     happened on the right machine.
+
+### Local Linux implementation note: command lifetime
+
+The Elixir local runner requires an exclusive per-workspace ownership check before dispatch, observable OS-child exit before stop completion, and verified evidence preservation before workspace deletion. Its PID-namespace/pidfd receipt is command-lifetime metadata, not durable scheduler or model retry state. Missing/ambiguous ownership blocks execution; SSH behavior is unchanged. See elixir/README.md for exact platform and operator assumptions.

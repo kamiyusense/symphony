@@ -46,7 +46,9 @@ defmodule SymphonyElixir.MixProject do
       ],
       test_ignore_filters: [
         "test/support/snapshot_support.exs",
-        "test/support/test_support.exs"
+        "test/support/test_support.exs",
+        # Standalone, explicitly configured harness; not an auto-discovered ExUnit test.
+        "test/local_recovery_integration.exs"
       ],
       dialyzer: [
         plt_add_apps: [:mix]
@@ -69,17 +71,17 @@ defmodule SymphonyElixir.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:bandit, "~> 1.8"},
+      {:bandit, "~> 1.13"},
       {:floki, ">= 0.30.0", only: :test},
       {:lazy_html, ">= 0.1.0", only: :test},
-      {:phoenix, "~> 1.8.0"},
+      {:phoenix, "~> 1.8.15"},
       {:phoenix_html, "~> 4.2"},
-      {:phoenix_live_view, "~> 1.1.0"},
-      {:req, "~> 0.5"},
+      {:phoenix_live_view, "~> 1.1.33"},
+      {:req, "~> 0.7.5"},
       {:jason, "~> 1.4"},
       {:yaml_elixir, "~> 2.12"},
-      {:solid, "~> 1.2"},
-      {:ecto, "~> 3.13"},
+      {:solid, "~> 1.3.4"},
+      {:ecto, "~> 3.14"},
       {:burrito, "~> 1.5", only: :prod, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false}

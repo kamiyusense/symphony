@@ -348,6 +348,7 @@ defmodule SymphonyElixir.CoreTest do
     assert Process.alive?(runtime_pid)
   end
 
+  @tag :os_isolation
   test "restarting the orchestrator does not overlap redispatched work" do
     issue_suffix = System.unique_integer([:positive])
 
@@ -456,6 +457,21 @@ defmodule SymphonyElixir.CoreTest do
     assert is_map(GenServer.call(restarted_pid, :snapshot))
     refute Process.alive?(first_worker_pid)
 
+    # An initial ownership refusal now retains the retry claim instead of bypassing
+    # its backoff on the next poll. Recover the pre-turn hook, then deliver that one reservation.
+    recovered_state =
+      eventually_value(fn ->
+        state = :sys.get_state(restarted_pid)
+        if map_size(state.running) > 0 or Map.has_key?(state.retry_attempts, issue.id), do: state
+      end)
+
+    if retry = recovered_state.retry_attempts[issue.id] do
+      assert MapSet.member?(recovered_state.claimed, issue.id)
+      assert :ok = SymphonyElixir.LocalProcess.drain(Path.join(test_root, issue.identifier))
+      Process.cancel_timer(retry.timer_ref)
+      send(restarted_pid, {:retry_issue, issue.id, retry.retry_token})
+    end
+
     second_worker_pid =
       eventually_value(fn ->
         children = Task.Supervisor.children(task_supervisor_name)
@@ -538,6 +554,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  @tag :os_isolation
   test "terminal issue state stops running agent before cleaning workspace" do
     test_root =
       Path.join(
@@ -953,6 +970,7 @@ defmodule SymphonyElixir.CoreTest do
     refute Map.has_key?(updated_state.retry_attempts, issue_id)
   end
 
+  @tag :os_isolation
   test "retry releases its claim when dispatch revalidation no longer finds the issue" do
     test_root =
       Path.join(
@@ -1535,6 +1553,7 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt == "Retry #2"
   end
 
+  @tag :os_isolation
   test "agent runner keeps workspace after successful codex run" do
     test_root =
       Path.join(
@@ -1572,7 +1591,7 @@ defmodule SymphonyElixir.CoreTest do
             ;;
           4)
             printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-1\"}}}'
-            printf '%s\\n' '{\"method\":\"turn/completed\"}'
+            printf '%s\\n' '{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-1\",\"turn\":{\"id\":\"turn-1\",\"status\":\"completed\"}}}'
             exit 0
             ;;
           *)
@@ -1619,6 +1638,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  @tag :os_isolation
   test "agent runner forwards timestamped codex updates to recipient" do
     test_root =
       Path.join(
@@ -1657,7 +1677,7 @@ defmodule SymphonyElixir.CoreTest do
               printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-live\"}}}'
               ;;
             4)
-              printf '%s\\n' '{\"method\":\"turn/completed\"}'
+              printf '%s\\n' '{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-live\",\"turn\":{\"id\":\"turn-live\",\"status\":\"completed\"}}}'
               ;;
             *)
               ;;
@@ -1777,6 +1797,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  @tag :os_isolation
   test "agent runner continues with a follow-up turn while the issue remains active" do
     test_root =
       Path.join(
@@ -1819,11 +1840,11 @@ defmodule SymphonyElixir.CoreTest do
             ;;
           4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-1"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-cont","turn":{"id":"turn-cont-1","status":"completed"}}}'
             ;;
           5)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-2"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-cont","turn":{"id":"turn-cont-2","status":"completed"}}}'
             ;;
         esac
       done
@@ -1909,6 +1930,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  @tag :os_isolation
   test "agent runner stops continuing once agent.max_turns is reached" do
     test_root =
       Path.join(
@@ -1950,11 +1972,11 @@ defmodule SymphonyElixir.CoreTest do
             ;;
           4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-1"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-max","turn":{"id":"turn-max-1","status":"completed"}}}'
             ;;
           5)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-2"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-max","turn":{"id":"turn-max-2","status":"completed"}}}'
             ;;
         esac
       done
@@ -2007,6 +2029,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  @tag :os_isolation
   test "app server starts with workspace cwd and expected startup command" do
     test_root =
       Path.join(
@@ -2053,7 +2076,7 @@ defmodule SymphonyElixir.CoreTest do
             printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-77\"}}}'
             ;;
           4)
-            printf '%s\\n' '{\"method\":\"turn/completed\"}'
+            printf '%s\\n' '{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-77\",\"turn\":{\"id\":\"turn-77\",\"status\":\"completed\"}}}'
             exit 0
             ;;
           *)
@@ -2153,6 +2176,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  @tag :os_isolation
   test "app server startup command supports codex args override from workflow config" do
     test_root =
       Path.join(
@@ -2197,7 +2221,7 @@ defmodule SymphonyElixir.CoreTest do
             printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-88\"}}}'
             ;;
           4)
-            printf '%s\\n' '{\"method\":\"turn/completed\"}'
+            printf '%s\\n' '{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-88\",\"turn\":{\"id\":\"turn-88\",\"status\":\"completed\"}}}'
             exit 0
             ;;
           *)
@@ -2238,6 +2262,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  @tag :os_isolation
   test "app server startup payload uses configurable approval and sandbox settings from workflow config" do
     test_root =
       Path.join(
@@ -2283,7 +2308,7 @@ defmodule SymphonyElixir.CoreTest do
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-99"}}}'
             ;;
           4)
-            printf '%s\\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-99","turn":{"id":"turn-99","status":"completed"}}}'
             exit 0
             ;;
           *)

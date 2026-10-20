@@ -1,4 +1,4 @@
-name: make-all
+name: portable-quality
 
 on:
   pull_request:
@@ -8,6 +8,7 @@ on:
 
 jobs:
   make-all:
+    name: Portable Quality
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -34,5 +35,40 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-mix-
 
-      - name: Verify make all
-        run: make all
+      - name: Set up Hex
+        run: mix local.hex --force
+
+      - name: Audit Hex dependencies
+        id: hex_audit
+        run: mix hex.audit
+
+      - name: Verify portable quality
+        id: portable
+        run: make --keep-going portable-ci
+
+      - name: Report verification scope
+        if: always()
+        env:
+          HEX_AUDIT_OUTCOME: ${{ steps.hex_audit.outcome }}
+          PORTABLE_OUTCOME: ${{ steps.portable.outcome }}
+        run: |
+          case "$HEX_AUDIT_OUTCOME" in
+            success) hex_result=PASS ;;
+            failure) hex_result=FAIL ;;
+            skipped|"") hex_result=NOT_RUN ;;
+            *) hex_result=UNKNOWN ;;
+          esac
+          case "$PORTABLE_OUTCOME" in
+            success) result=PASS ;;
+            failure) result=FAIL ;;
+            skipped|"") result=NOT_RUN ;;
+            *) result=UNKNOWN ;;
+          esac
+          {
+            printf 'Hex Audit: %s\n\n' "$hex_result"
+            printf 'Portable Quality: %s\n\n' "$result"
+            printf 'OS Isolation: NOT_RUN (separate required Linux gate)\n\n'
+            printf 'Full Recovery Gate: NO-GO (this Portable CI alone; OS Isolation is NOT_RUN)\n\n'
+            printf 'Recorded Recovery Goal (LOCAL_ONLY): GO (assessed implementation a0a962fd389a57341703ff595adb5062b385e5bc; docs/symphony-recovery-goal-closure.md)\n\n'
+            printf 'Production Unattended: NO-GO\n'
+          } | tee -a "$GITHUB_STEP_SUMMARY"

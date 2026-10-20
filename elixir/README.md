@@ -27,6 +27,12 @@ Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud se
 tools with configured host-side auth and removes declared tracker-token environment variables from
 the Codex child, so the agent does not need a second tracker login.
 
+A `turn/completed` notification succeeds only with explicit `params.turn.status: "completed"`
+and non-empty string thread and turn IDs.
+Statuses `failed` and `interrupted` produce the existing failure and cancellation events/errors.
+Unknown, missing, or malformed status information returns an unconfirmed-completion error and
+emits a failure event; terminal events retain the original protocol payload.
+
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
 
@@ -36,6 +42,13 @@ entries are in memory only; restarting the orchestrator clears that blocked map,
 tracker issue can become a dispatch candidate again after restart.
 
 ## How to use it
+
+The local process helper's existing exit 73 failure path emits one bounded stderr
+`ERROR NO-GO` diagnostic, retained by AppServer at warning level. It includes only
+safe exception labels, numeric errno, and the last six traceback frame locations
+(trusted helper function/line or fixed external labels), with a truncation flag.
+Exception messages and command/configuration contents are omitted. Historical
+exit 73 failures without detailed logs still have an unknown cause.
 
 1. Make sure your codebase is set up to work well with agents: see
    [Harness engineering](https://openai.com/index/harness-engineering/).
@@ -403,3 +416,112 @@ you.
 ## License
 
 This project is licensed under the [Apache License 2.0](../LICENSE).
+
+## Local Linux command lifetime
+
+Local hooks and app-server commands use the existing Bubblewrap PID namespace support and Python standard library. These tools must already be available; Symphony does not install them or fall back to an unguarded command. SSH worker behavior is unchanged and is not covered by this local recovery guarantee.
+
+One private workspace lock and an identity receipt under the workspace root's `.symphony-processes/` directory survive worker/VM restarts. A live owner, changed boot/start/UID/namespace identity, malformed receipt, or unconfirmed exit blocks dispatch. Only a verified nested PID-namespace init is signalled through a pidfd. Namespace exit kills all descendants, including processes which change sessions. The command sees ownership records read-only; a blocked stdin cannot block stop handling.
+
+Local shutdown waits for OS process exit, separately from BEAM task exit. Before deleting a local workspace, Symphony preserves and reads back a tar snapshot and, for Git workspaces, the binary diff. Failure leaves the workspace and evidence in place. Receipts and snapshots are outside the per-Issue folder and are not automatically removed.
+
+This assumes a trusted operator UID and local filesystem. Locks serialize cooperating writers; they do not defend against a malicious external process with the same UID modifying operator state. PID-namespace changes across containers, remote workers, missing kernel/tool support, and unverified ownership remain NO-GO. No authentication, billing, scheduler, retry, or tracker policy is added or changed.
+
+Model-free regressions: `python3 -B test/local_process_test.py` and the ordinary `mix test` entry for `test/symphony_elixir/local_process_test.exs`. The retained isolated integration script is `test/local_recovery_integration.exs`; use the dedicated disposable WORKFLOW/evidence paths described in the run's REPRODUCE.md. Never point it at a production tracker/workspace.
+
+An ownership-blocked local dispatch keeps a retry with the existing capped
+backoff in the orchestrator queue. No worker is started until `LocalProcess.recover/1` confirms
+the previous command is stopped; a refused retry must not leave a claim without
+a scheduled recovery check. Active tracker issues remain eligible after recovery,
+while terminal or no-longer-routable issues follow the normal claim-release path.
+
+Local startup status is read as a complete line within the existing three-second
+startup deadline and a 4096-byte bound before the command barrier is released.
+Fragmented pipe reads are not malformed completion events; truncated, silent,
+oversized, or invalid status remains NO-GO. Closing an already closed port is
+idempotent, but the same OS ownership drain must still succeed before returning.
+
+### Portable quality and required OS isolation gates
+
+`make --keep-going portable-ci` runs setup, build, format, specs/Credo, Portable
+coverage, the existing six Python diagnostic regressions, and Dialyzer.
+Independent checks continue after a failing prerequisite.
+`make portable-test` runs the Portable subset without coverage. These commands
+exclude `os_isolation` and opt-in `live_e2e` tests, not arbitrary failures.
+
+`make os-isolation` first checks Linux namespace and procfs prerequisites, then
+runs every `os_isolation` test. A failed or unknown required probe stops this gate
+as BLOCKED before tests; it never certifies isolation. The suite includes local
+AppServer/hook integrations and the 19-case Python ownership/recovery regression.
+These use model-free fake workers with real Linux isolation, not real Codex tasks.
+
+`make all` / `make ci` and `make coverage` retain the full test suite. No test was
+removed, no runtime safety code changed, and the 100% coverage threshold and
+module exclusions are unchanged. Portable coverage is measured independently;
+its result cannot replace full coverage or the required OS isolation evidence.
+GitHub runs only Portable quality and reports OS Isolation: NOT_RUN and Full
+Recovery Gate: NO-GO, even when Portable passes. LIVE tests remain separately opt-in.
+
+Portable bridge regressions use a scripted helper only to verify output, nonzero
+status, timeout, and control-error propagation in the Elixir adapter. Their PASS
+is not evidence of Linux isolation or recovery; the real OS suite remains required.
+
+The standalone `test/local_recovery_integration.exs` remains an explicitly configured
+integration harness from earlier evidence. Mix does not auto-discover it; no new
+run or new PASS is claimed for that harness by either subset gate.
+
+### Dependency security baseline
+
+The lockfile includes reviewed security updates for the HTTP server/client and
+LiveView stack. Direct dependency floors retain Bandit 1.13, Phoenix 1.8.15,
+LiveView 1.1.33 and Req 0.7.5. Ecto 3.14 and Solid 1.3.4 allow the fixed Decimal
+3.x dependency; Jason also supports that version. Mint 1.11 and HPAX 1.1 remain
+locked. Req no longer automatically unpacks archive responses; JSON tracker
+responses remain supported. Do not opt untrusted endpoints into archive decoding.
+Explicit empty or whitespace-only worker commands remain invalid; the changeset
+checks them independently of Ecto's required-field empty-value semantics.
+
+Run `mix hex.audit` with fresh official advisory metadata alongside the existing
+quality gates. A clean advisory result is a point-in-time check, not a guarantee
+that future vulnerabilities cannot be discovered. Dependency security regressions
+are included in both Portable and full tests. The standalone recovery harness is
+explicitly classified outside Mix auto-discovery; its separate execution path and
+the complete OS isolation gate remain unchanged.
+
+
+### Formal active-turn interruption
+
+The Port owner handles a scoped stop message for its own Issue. Runtime metadata
+retains `thread_id`, `turn_id`, a random app-server session identity and the owner
+PID explicitly; session strings are never split to infer protocol targets. One
+`turn/interrupt` request is sent with the current `threadId` and `turnId`. Duplicate
+stop requests share that operation. A successful response **and** a matching
+`turn/completed` whose status is `interrupted` are required for
+`interrupt_confirmed`, in either arrival order. Other turns cannot confirm it.
+The wait has an absolute deadline of `min(codex.read_timeout_ms, 2000)` milliseconds;
+stdio writes do not suspend on a busy Port. Error, missing IDs/notification,
+timeout or owner death remains `interrupt_unconfirmed`.
+
+Issue termination, non-active/routing/missing transitions, stalls and orderly
+runtime shutdown use this owner control before the existing Task stop and owned
+process drain. Local cleanup is mandatory regardless of protocol outcome and is
+recorded separately. Turn timeout/input-required/early error also attempts
+interruption while the owner is still available. An unexpectedly dead owner
+cannot send an interrupt: local cleanup still runs, and an unresolved turn blocks
+redispatch. There is no automatic interrupt resend or cloud reconciliation.
+
+Before `turn/start`, a create-only pending receipt is synchronously written beside
+the workspace under `.symphony-processes/<workspace hash>/turns/`. Only a matching
+terminal event (or both interruption confirmations) creates its resolved receipt.
+Pending/resolved receipts are retained, including across VM restart and workspace
+removal; an unknown turn prevents dispatch and workspace deletion even after local
+process recovery. Unknown or malformed receipts fail closed. Protocol results and
+owned-process/namespace evidence are independent. Do not manually remove a pending
+receipt merely because local processes have exited. SSH protocol receipts use the
+operator's local WORKFLOW directory, not an assumed local copy of a remote path;
+remote OS recovery is still outside the local Linux guarantee.
+
+Model-free interruption tests live in `app_server_interrupt_test.exs` and belong
+to the required `os_isolation` gate. They do not prove a real cloud service has
+cancelled inference. A separately authorized real App Server interruption E2E is
+still required; this implementation does not grant unattended-production GO.

@@ -4,7 +4,8 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, PathSafety, SSH}
+  alias SymphonyElixir.Codex.AppServer
+  alias SymphonyElixir.{Config, LocalProcess, PathSafety, SSH}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
@@ -36,6 +37,27 @@ defmodule SymphonyElixir.Workspace do
         {:error, error}
     end
   end
+
+  @spec ensure_stopped(map() | String.t(), worker_host()) :: :ok | {:error, term()}
+  def ensure_stopped(issue, nil) do
+    with {:ok, workspace} <- workspace_path_for_issue(workspace_key(issue), nil) do
+      with :ok <- LocalProcess.recover(workspace), do: AppServer.recovery_ready(workspace)
+    end
+  end
+
+  def ensure_stopped(issue, host) when is_binary(host) do
+    with {:ok, workspace} <- workspace_path_for_issue(workspace_key(issue), host),
+         do: AppServer.recovery_ready(workspace, host)
+  end
+
+  @spec stop_owned(map() | String.t(), worker_host()) :: :ok | {:error, term()}
+  def stop_owned(issue, nil) do
+    with {:ok, workspace} <- workspace_path_for_issue(workspace_key(issue), nil) do
+      LocalProcess.drain(workspace)
+    end
+  end
+
+  def stop_owned(_issue, host) when is_binary(host), do: :ok
 
   defp ensure_workspace(workspace, nil) do
     cond do
@@ -157,8 +179,13 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp remove_local_workspace(workspace) do
-    maybe_run_before_remove_hook(workspace, nil)
-    File.rm_rf(workspace)
+    with :ok <- AppServer.recovery_ready(workspace),
+         :ok <- maybe_run_before_remove_hook(workspace, nil),
+         :ok <- LocalProcess.snapshot(workspace) do
+      File.rm_rf(workspace)
+    else
+      {:error, reason} -> {:error, reason, workspace}
+    end
   end
 
   @spec remove_issue_workspaces(term()) :: :ok
@@ -399,21 +426,15 @@ defmodule SymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
-    task =
-      Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
-      end)
-
-    case Task.yield(task, timeout_ms) do
+    case LocalProcess.run(command, workspace, timeout_ms) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
-      nil ->
-        Task.shutdown(task, :brutal_kill)
-
-        Logger.warning("Workspace hook timed out hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local timeout_ms=#{timeout_ms}")
-
+      {:error, :timeout} ->
         {:error, {:workspace_hook_timeout, hook_name, timeout_ms}}
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
